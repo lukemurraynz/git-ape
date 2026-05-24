@@ -168,6 +168,68 @@ Coordinate the deployment of Azure resources by delegating to specialized subage
 - This is a brand new deployment (no existing resources)
 - User explicitly says "deploy fresh" or "new deployment"
 
+## Session Resumption
+
+Before starting a new deployment workflow, check whether any previous deployment was interrupted.
+
+**On startup (before asking what to deploy):**
+```bash
+# List any deployments with a resumable phase state
+_jq_read() { local file=$1 field=$2
+  jq -r ".$field" "$file" 2>/dev/null || \
+  python3 -c "import json,sys; print(json.load(sys.stdin)['$field'])" < "$file" 2>/dev/null
+}
+
+for dir in .azure/deployments/*/; do
+  state_file="${dir}tracking/phase-state.json"
+  if [ -f "$state_file" ]; then
+    status=$(_jq_read "$state_file" status)
+    case "$status" in
+      suspended|blocked|awaiting-confirmation)
+        dep=$(_jq_read "$state_file" deploymentId)
+        phase=$(_jq_read "$state_file" phase)
+        updated=$(_jq_read "$state_file" updatedAt)
+        echo "Found: $dep | $phase | $status | $updated"
+        ;;
+    esac
+  fi
+done
+```
+
+**If one or more resumable deployments are found**, show a resume prompt before asking what to deploy:
+
+```markdown
+⏸️ In-Progress Deployment Found
+
+| Deployment | Last Stage | Status | Last Updated |
+|------------|-----------|--------|--------------|
+| {deploymentId} | {phase} | {status} | {updatedAt} |
+
+Would you like to:
+R. Resume — continue from {phase}
+N. Start a new deployment
+V. View details of the interrupted deployment
+```
+
+**If user chooses R:**
+1. Set `DEPLOYMENT_ID` to the found deployment's ID
+2. Read existing artifacts from `.azure/deployments/$DEPLOYMENT_ID/` to reconstruct context
+3. Determine the resume point from `completedPhases` in `phase-state.json`:
+   - Skip all phases listed in `completedPhases`
+   - Re-enter at the phase listed in `phase` with `status` of `suspended`, `blocked`, or `awaiting-confirmation`
+4. For `blocked` at the security gate: re-show the blocking findings from `security-gate.json` and present options A/B/C/D again
+5. For `awaiting-confirmation`: re-display the deployment summary and wait for user approval
+6. For `suspended` mid-phase: re-invoke the subagent for that phase with the existing artifact context
+
+**If user chooses N:** Proceed with a fresh deployment. Do not modify the interrupted deployment's state.
+
+**If user chooses V:** Read and display `requirements.json` summary and the current `phase-state.json`, then ask R or N.
+
+**Skip resume check if:**
+- User's opening message explicitly says "new deployment", "start fresh", "skip resume", or "ignore previous"
+- No `.azure/deployments/` directory exists
+- All found `phase-state.json` files have terminal statuses (`completed`, `failed`, `aborted`)
+
 ## Workflow Stages
 
 ### Stage 1: Requirements Gathering
@@ -489,10 +551,66 @@ For each deployment, save:
 
 **In Headless Mode:** Commit these files to the branch so the PR shows full deployment artifacts. The PR diff becomes the deployment review.
 
+**Phase State Tracking:**
+
+Write `tracking/phase-state.json` at every stage boundary so interrupted sessions can be resumed.
+
+**Pattern — write BEFORE invoking subagent (`status: in-progress`), then AFTER it returns (`status: completed`):**
+
+```bash
+# Before delegating to a subagent:
+cat > .azure/deployments/$DEPLOYMENT_ID/tracking/phase-state.json << 'EOF'
+{
+  "deploymentId": "DEPLOYMENT_ID_PLACEHOLDER",
+  "phase": "PHASE_PLACEHOLDER",
+  "status": "in-progress",
+  "startedAt": "STARTED_AT_PLACEHOLDER",
+  "updatedAt": "UPDATED_AT_PLACEHOLDER",
+  "completedPhases": [],
+  "mode": "MODE_PLACEHOLDER"
+}
+EOF
+# Replace placeholders with actual values using jq or shell substitution at write time
+
+# After the subagent returns successfully:
+# Re-write with status: completed and the current phase added to completedPhases
+```
+
+**Phase names and transition events:**
+
+| Phase | Write `in-progress` when | Write `completed` when |
+|-------|--------------------------|------------------------|
+| `stage-1-requirements` | Gatherer invoked | `requirements.json` saved + user confirmed |
+| `stage-2-template` | Generator invoked | `template.json`, `security-analysis.md`, `preflight-report.md`, `cost-estimate.json` saved |
+| `stage-2.5-security-gate` | Gate evaluated | `security-gate.json` shows `PASSED` or `OVERRIDDEN` |
+| `stage-2.75-waf-review` | Architect invoked | `waf-review.md` saved |
+| `stage-2.85-confirmation` | Confirmation shown to user | User types yes/proceed/deploy |
+| `stage-3-deployment` | Deployer invoked | `deployment.log` saved with succeeded status |
+| `stage-4-validation` | Integration tests start | `tests.json` saved |
+
+**Terminal statuses (never resumed):** `completed`, `failed`, `aborted`
+
+**Resumable statuses:** `suspended`, `blocked`, `awaiting-confirmation`
+
+**On any abort or unrecoverable error — write suspended state before ending:**
+```bash
+# Write status: suspended with a suspendReason before the session closes
+# Include all phases completed so far in completedPhases
+```
+
+**Special case — Stage 2.5 Security Gate BLOCKED, user chose D (abort for now):**
+Write `status: blocked` (not `suspended`) — resume will re-show the blocking findings from `security-gate.json` and offer A/B/C/D again.
+
+**Special case — Stage 2.85 awaiting confirmation:**
+Write `status: awaiting-confirmation` immediately after showing the deployment summary, before waiting for the user's yes/no. Resume will re-display the summary.
+
+**Final state — all stages complete:**
+Write `status: completed` with all 7 phase keys in `completedPhases`. This deployment is never offered for resumption.
+
 **Before Starting:**
 ```bash
 DEPLOYMENT_ID="deploy-$(date +%Y%m%d-%H%M%S)"
-mkdir -p .azure/deployments/$DEPLOYMENT_ID
+mkdir -p .azure/deployments/$DEPLOYMENT_ID/tracking
 ```
 
 **After Each Stage:**
