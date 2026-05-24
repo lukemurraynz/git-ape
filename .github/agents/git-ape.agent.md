@@ -180,20 +180,22 @@ _jq_read() { local file=$1 field=$2
   python3 -c "import json,sys; print(json.load(sys.stdin)['$field'])" < "$file" 2>/dev/null
 }
 
-for dir in .azure/deployments/*/; do
-  state_file="${dir}tracking/phase-state.json"
-  if [ -f "$state_file" ]; then
-    status=$(_jq_read "$state_file" status)
-    case "$status" in
-      suspended|blocked|awaiting-confirmation)
-        dep=$(_jq_read "$state_file" deploymentId)
-        phase=$(_jq_read "$state_file" phase)
-        updated=$(_jq_read "$state_file" updatedAt)
-        echo "Found: $dep | $phase | $status | $updated"
-        ;;
-    esac
-  fi
-done
+if [ -d .azure/deployments ]; then
+  for dir in .azure/deployments/*/; do
+    state_file="${dir}tracking/phase-state.json"
+    if [ -f "$state_file" ]; then
+      status=$(_jq_read "$state_file" status)
+      case "$status" in
+        suspended|blocked|awaiting-confirmation)
+          dep=$(_jq_read "$state_file" deploymentId)
+          phase=$(_jq_read "$state_file" phase)
+          updated=$(_jq_read "$state_file" updatedAt)
+          echo "Found: $dep | $phase | $status | $updated"
+          ;;
+      esac
+    fi
+  done
+fi
 ```
 
 **If one or more resumable deployments are found**, show a resume prompt before asking what to deploy:
