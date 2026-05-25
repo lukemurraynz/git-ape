@@ -174,7 +174,9 @@ Before starting a new deployment workflow, check whether any previous deployment
 
 **On startup (before asking what to deploy):**
 ```bash
-# List any deployments with a resumable phase state
+# List any deployments with a resumable phase state.
+# Treat in-progress as resumable because an agent crash/kill may leave the
+# phase-state file before it can be rewritten to suspended.
 _jq_read() { local file=$1 field=$2
   jq -r ".$field" "$file" 2>/dev/null || \
   python3 -c "import json,sys; print(json.load(sys.stdin)['$field'])" < "$file" 2>/dev/null
@@ -185,7 +187,7 @@ for dir in .azure/deployments/*/; do
   if [ -f "$state_file" ]; then
     status=$(_jq_read "$state_file" status)
     case "$status" in
-      suspended|blocked|awaiting-confirmation)
+      in-progress|suspended|blocked|awaiting-confirmation)
         dep=$(_jq_read "$state_file" deploymentId)
         phase=$(_jq_read "$state_file" phase)
         updated=$(_jq_read "$state_file" updatedAt)
@@ -216,10 +218,10 @@ V. View details of the interrupted deployment
 2. Read existing artifacts from `.azure/deployments/$DEPLOYMENT_ID/` to reconstruct context
 3. Determine the resume point from `completedPhases` in `phase-state.json`:
    - Skip all phases listed in `completedPhases`
-   - Re-enter at the phase listed in `phase` with `status` of `suspended`, `blocked`, or `awaiting-confirmation`
+   - Re-enter at the phase listed in `phase` with `status` of `in-progress`, `suspended`, `blocked`, or `awaiting-confirmation`
 4. For `blocked` at the security gate: re-show the blocking findings from `security-gate.json` and present options A/B/C/D again
 5. For `awaiting-confirmation`: re-display the deployment summary and wait for user approval
-6. For `suspended` mid-phase: re-invoke the subagent for that phase with the existing artifact context
+6. For `in-progress` or `suspended` mid-phase: re-invoke the subagent for that phase with the existing artifact context
 
 **If user chooses N:** Proceed with a fresh deployment. Do not modify the interrupted deployment's state.
 
@@ -559,18 +561,27 @@ Write `tracking/phase-state.json` at every stage boundary so interrupted session
 
 ```bash
 # Before delegating to a subagent:
-cat > .azure/deployments/$DEPLOYMENT_ID/tracking/phase-state.json << 'EOF'
-{
-  "deploymentId": "DEPLOYMENT_ID_PLACEHOLDER",
-  "phase": "PHASE_PLACEHOLDER",
-  "status": "in-progress",
-  "startedAt": "STARTED_AT_PLACEHOLDER",
-  "updatedAt": "UPDATED_AT_PLACEHOLDER",
-  "completedPhases": [],
-  "mode": "MODE_PLACEHOLDER"
-}
-EOF
-# Replace placeholders with actual values using jq or shell substitution at write time
+mkdir -p ".azure/deployments/$DEPLOYMENT_ID/tracking"
+PHASE_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+COMPLETED_PHASES_JSON="${COMPLETED_PHASES_JSON:-[]}"
+
+jq -n \
+  --arg deploymentId "$DEPLOYMENT_ID" \
+  --arg phase "$PHASE" \
+  --arg status "in-progress" \
+  --arg startedAt "$PHASE_STARTED_AT" \
+  --arg updatedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --arg mode "$MODE" \
+  --argjson completedPhases "$COMPLETED_PHASES_JSON" \
+  '{
+    deploymentId: $deploymentId,
+    phase: $phase,
+    status: $status,
+    startedAt: $startedAt,
+    updatedAt: $updatedAt,
+    completedPhases: $completedPhases,
+    mode: $mode
+  }' > ".azure/deployments/$DEPLOYMENT_ID/tracking/phase-state.json"
 
 # After the subagent returns successfully:
 # Re-write with status: completed and the current phase added to completedPhases
@@ -590,7 +601,9 @@ EOF
 
 **Terminal statuses (never resumed):** `completed`, `failed`, `aborted`
 
-**Resumable statuses:** `suspended`, `blocked`, `awaiting-confirmation`
+**Resumable statuses:** `in-progress`, `suspended`, `blocked`, `awaiting-confirmation`
+
+`in-progress` is resumable because a crash, kill, or host interruption can stop the agent before it writes `suspended`. If `updatedAt` is very recent, tell the user it may represent a still-running session before offering R/N/V.
 
 **On any abort or unrecoverable error — write suspended state before ending:**
 ```bash
